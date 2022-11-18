@@ -1,0 +1,174 @@
+#!/usr/bin/env python3.10
+from socket import *
+from sys import *
+import threading
+import time
+import re
+import select
+
+throughputs = {}
+
+# Helper method to receive message of any size
+def recvAll(socket):
+    bufferSize = 2048
+    recvMessage = bytes('', 'utf-8')
+    while True:
+        message = socket.recv(bufferSize)
+        recvMessage += message
+        if len(message) < bufferSize:
+            break
+    return recvMessage
+
+# Helper method to receive response header and response body separately
+def recvResponse(socket):
+    # Read response header
+    bufferSize = 2048
+    recvData= bytes('', 'utf-8')
+    segment = bytes('', 'utf-8')
+    headerLength = 0
+    while segment.find(b"\r\n\r\n") < 0:
+        recvData += segment
+        headerLength += len(segment)
+        segment = socket.recv(bufferSize)
+    headerEnd = segment.find(b"\r\n\r\n")
+    headerLength += headerEnd
+    recvData += segment
+    # Separate header and body
+    responseHeader = recvData[: headerLength + 4]
+    print("Proxy received response with header:")
+    print(responseHeader.decode())
+    responseBody = bytes('', 'utf-8')
+    if headerLength + 4 < len(recvData):
+        responseBody = recvData[headerLength + 4 :]
+    # Parse header to find content length
+    responseHeader = responseHeader.decode()
+    startIndex = responseHeader.find("Content-Length") + 16
+    endIndex = responseHeader.find("Keep-Alive") - 3
+    contentLength = int(responseHeader[startIndex : endIndex + 1])
+    print("Content length is: " + str(contentLength))
+    responseHeader = responseHeader.encode()
+    # Read the rest of response body
+    bodyLength = len(responseBody)
+    while bodyLength < contentLength:
+        readable, writable, exceptional = select.select([socket], [], [])
+        for s in readable:
+            if s is socket:
+                bodySegment = s.recv(bufferSize)
+                responseBody += bodySegment
+                bodyLength += len(bodySegment)
+    print("Successfully received the whole response message.")
+    return responseHeader, responseBody, contentLength
+
+# Helper method to modify request based on adapted bitrate
+def adaptBitrate(httpRequest, bitrates, pair):
+    currentThroughput = throughputs[pair]
+    print("Available bitrates are: " + str(bitrates))
+    newBitrate = str(bitrates[-1])
+    for bitrate in bitrates:
+        if currentThroughput >= 1.5 * bitrate:
+            newBitrate = str(bitrate)
+            break
+    httpRequest = httpRequest.decode()
+    startIndex = httpRequest.find("bunny_") + 6
+    endIndex = httpRequest.find("bps") - 1
+    oldBitrate = httpRequest[startIndex : endIndex + 1]
+    httpRequest = re.sub(oldBitrate, newBitrate, httpRequest)
+    return httpRequest.encode()
+
+# Helper method to request and receive nolist manifest file from server
+def getNolistManifestFile(proxySocket, httpRequest):
+    startIndex = httpRequest.find(b"GET") + 5
+    endIndex = httpRequest.find(b".mpd") - 1
+    oldFile = httpRequest[startIndex : endIndex + 1]
+    newFile = oldFile + b"_nolist"
+    httpRequest = re.sub(oldFile, newFile, httpRequest)
+    print("Proxy sent modified manifest file request:")
+    print(httpRequest.decode())
+    proxySocket.send(httpRequest)
+    httpResponseHeader, httpResponseBody, contentLength = recvResponse(proxySocket)
+    httpResponse = httpResponseHeader + httpResponseBody
+    return httpResponse
+
+
+def clientHandler(connectionSocket, fakeIp, serverIp, alpha, pair, logFile):
+    bitrates = []
+    serverPort = 8080
+    proxySocket = socket(AF_INET, SOCK_STREAM)
+    proxySocket.bind((fakeIp, 0))
+    proxySocket.connect((serverIp, serverPort))
+    print("Proxy socket established.")
+    # At this point, proxy connects with server
+    while True:
+        # Receive the request
+        httpRequest = recvAll(connectionSocket)
+        tStart = time.time()
+        print("Proxy received request:")
+        print(httpRequest.decode())
+        if re.search(b"bps/BigBuckBunny", httpRequest):
+            httpRequest = adaptBitrate(httpRequest, bitrates, pair)
+        # Send request to server
+        proxySocket.send(httpRequest)
+        print("Proxy sent httpRequest to server.")
+        # Receive the response
+        durationStart = time.time()
+        httpResponseHeader, httpResponseBody, contentLength = recvResponse(proxySocket)
+        tFinish = time.time()
+        httpResponse = httpResponseHeader + httpResponseBody
+        if re.search(b".mpd", httpRequest):
+            # Parse manifest file
+            payload = httpResponseBody.decode()
+            while payload.find("bandwidth") > 0:
+                startIndex = payload.find("bandwidth") + 11
+                i = startIndex
+                while payload[i].isnumeric():
+                    i += 1
+                bitrate = int(payload[startIndex : i])
+                bitrates.append(bitrate)
+                payload = payload[i + 1 :]
+            bitrates.sort(reverse=True)
+            print("Bitrates are: " + str(bitrates))
+            httpResponse = getNolistManifestFile(proxySocket, httpRequest)
+            if pair not in throughputs:
+                throughputs[pair] = bitrates[-1]
+        # Send response to client
+        connectionSocket.send(httpResponse)
+        print("Proxy sent httpResponse to client.")
+        # When the clients is requesting video chunk
+        if re.search(b"bps/BigBuckBunny", httpRequest):
+            # Calculate throughput
+            newThroughput = contentLength / (tFinish - tStart)
+            print("New throughput is: " + str(newThroughput))
+            throughputs[pair] = alpha * newThroughput + (1 - alpha) * throughputs[pair]
+            print("Current throughput is: " + str(throughputs[pair]))
+            # Logging
+            logTime = str(time.time())
+            logDuration = str(tFinish - durationStart)
+            logTput = str(newThroughput)
+            logAvgtput = str(throughputs[pair])
+            httpRequest = httpRequest.decode()
+            logBitrate = str(int(httpRequest[httpRequest.find("bunny_") + 6 : httpRequest.find("bps")]) // 1000)
+            logServerIp = serverIp
+            logChunkname = httpRequest[httpRequest.find("GET") + 4 : httpRequest.find("HTTP") - 1]
+            file1 = open(logFile, "a")
+            file1.write(logTime + " " + logDuration + " " + logTput + " " + logAvgtput + " " + logBitrate + " " + logServerIp + " " + logChunkname + "\n")
+            file1.close()
+            print("Logging is completed.")
+
+
+if __name__ == '__main__':
+    logFile = argv[1]
+    alpha = float(argv[2])
+    listenPort = int(argv[3])
+    fakeIp = argv[4]
+    serverIp = argv[5]
+    listenSocket = socket(AF_INET, SOCK_STREAM)
+    listenSocket.bind(('0.0.0.0', listenPort))
+    listenSocket.listen(1)
+    # At this point, proxy starts listening
+    while True:
+        connectionSocket, connectionAddr = listenSocket.accept()
+        # At this point, client connects with proxy
+        pair = (connectionAddr[0], serverIp)
+        threading.Thread(target=clientHandler, args=(connectionSocket, fakeIp, serverIp, alpha, pair, logFile)).start()
+        
+        
